@@ -69,15 +69,36 @@ class ModelConfig:
     num_heads: int
     context_length: int       # prompt + cached tokens
     generation_window: int    # planned decode horizon per request
+    experts_per_layer: int = 0
+    active_experts: int = 0
+    expert_param_fraction: float = 0.0
+    shared_param_fraction: float = 1.0
+    moe_dispatch_factor: float = 2.0  # out + back traffic multiplier per token
 
     @property
     def flops_per_token(self) -> float:
-        # 2 * params gives a decent dense-transformer decode estimate.
-        return 2.0 * self.num_params
+        return 2.0 * self.active_params
 
     @property
     def total_cached_tokens(self) -> int:
         return self.context_length + self.generation_window
+
+    @property
+    def is_moe(self) -> bool:
+        return (
+            self.experts_per_layer > 0
+            and self.active_experts > 0
+            and self.expert_param_fraction > 0
+        )
+
+    @property
+    def active_params(self) -> float:
+        if not self.is_moe:
+            return self.num_params
+        shared = self.num_params * self.shared_param_fraction
+        expert_pool = self.num_params * self.expert_param_fraction
+        expert_active = expert_pool * (self.active_experts / self.experts_per_layer)
+        return shared + expert_active
 
 
 GPU_PRESETS: Dict[str, GPUConfig] = {
@@ -160,13 +181,18 @@ QUANT_PRESETS: Dict[int, QuantConfig] = {
 
 
 MODEL = ModelConfig(
-    name="Qwen3-235B",
+    name="Qwen3-235B-A22B",
     num_params=235e9,
-    num_layers=120,
-    hidden_size=12288,
-    num_heads=96,
-    context_length=4096, # up to 256K-token long-context understanding
+    num_layers=94,
+    hidden_size=1536,
+    num_heads=64,
+    context_length=4096,  # up to 256K-token long-context understanding
     generation_window=1024,
+    experts_per_layer=128,
+    active_experts=8,
+    expert_param_fraction=0.88,   # majority of params live in experts
+    shared_param_fraction=0.12,   # router + shared FFNs + attention
+    moe_dispatch_factor=2.0,      # send + gather
 )
 
 
@@ -189,10 +215,6 @@ def kv_bytes_per_token(model: ModelConfig, quant: QuantConfig) -> float:
     return 2.0 * model.num_layers * model.hidden_size * quant.kv_bytes_per_elem
 
 
-# Tensor Parallelism splitting parameters of each layer across multiple GPUs 
-# (e.g., splitting the attention/MLP matrices). 
-# After each GPU computes its partial result, they must synchronize (e.g., by all-reduce), 
-# which causes communication overhead.
 def tensor_parallel_comm_bytes(model: ModelConfig, tp: int, pp: int) -> float:
     if tp <= 1:
         return 0.0
@@ -213,17 +235,39 @@ def pipeline_comm_bytes(model: ModelConfig, pp: int) -> float:
     return activation_size * boundaries
 
 
+def moe_dispatch_bytes(model: ModelConfig) -> float:
+    if not model.is_moe:
+        return 0.0
+    bytes_per_activation = 2.0  # assume fp16 routed activations
+    return (
+        model.hidden_size
+        * bytes_per_activation
+        * model.active_experts
+        * model.moe_dispatch_factor
+    )
+
+
 def fits_memory(
     gpu: GPUConfig,
     model: ModelConfig,
     quant: QuantConfig,
     tp: int,
     pp: int,
+    ep: int,
     batch_size: int,
     safety_margin: float = 0.15,
 ) -> Tuple[bool, float, Dict[str, float]]:
     total_weights = model.num_params * quant.bytes_per_param
-    weights_per_gpu = total_weights / (tp * pp)
+    base_shards = tp * pp
+
+    if model.is_moe:
+        shared_weights = total_weights * model.shared_param_fraction
+        expert_weights = total_weights * model.expert_param_fraction
+        weights_per_gpu = (shared_weights / base_shards) + (
+            expert_weights / (base_shards * ep)
+        )
+    else:
+        weights_per_gpu = total_weights / (base_shards)
 
     kv_bytes_token = kv_bytes_per_token(model, quant)
     kv_per_gpu_per_token = kv_bytes_token / (tp * pp)
@@ -255,18 +299,25 @@ def evaluate_plan(
     batch_size: int,
     tp: int,
     pp: int,
+    ep: int,
     racks: int,
 ) -> Optional[Dict[str, float]]:
     if model.num_layers % pp != 0 or model.num_heads % tp != 0:
         return None
+    if model.is_moe and ep <= 0:
+        return None
+    if model.is_moe and model.experts_per_layer % ep != 0:
+        return None
 
     gpu = GPU_PRESETS[rack.gpu_key]
     total_gpus = racks * rack.servers_per_rack * rack.gpus_per_server
-    gpus_per_instance = tp * pp
+    gpus_per_instance = tp * pp * max(ep, 1)
     if gpus_per_instance > total_gpus:
         return None
 
-    mem_ok, mem_usage, mem_breakdown = fits_memory(gpu, model, quant, tp, pp, batch_size)
+    mem_ok, mem_usage, mem_breakdown = fits_memory(
+        gpu, model, quant, tp, pp, ep, batch_size
+    )
     if not mem_ok:
         return None
 
@@ -302,6 +353,8 @@ def evaluate_plan(
             network_bytes["inter_rack"] += tp_comm
 
     pp_comm = pipeline_comm_bytes(model, pp)
+    moe_comm = 0.0
+
     if pp_comm > 0.0:
         servers_per_stage = math.ceil(tp / rack.gpus_per_server)
         servers_needed = servers_per_stage * pp
@@ -315,10 +368,21 @@ def evaluate_plan(
         else:
             network_bytes["inter_rack"] += pp_comm
 
+    if model.is_moe and ep > 1:
+        moe_comm = moe_dispatch_bytes(model)
+        ep_servers = math.ceil(ep / rack.gpus_per_server)
+        ep_racks = math.ceil(ep_servers / rack.servers_per_rack)
+        if ep_servers <= 1:
+            network_bytes["intra"] += moe_comm
+        elif ep_racks <= 1:
+            network_bytes["inter_server"] += moe_comm
+        else:
+            network_bytes["inter_rack"] += moe_comm
+
     # Force inter-rack comm if the instance cannot fit in a single rack
     gpus_per_rack = rack.gpus_per_server * rack.servers_per_rack
     if gpus_per_instance > gpus_per_rack:
-        network_bytes["inter_rack"] += tp_comm + pp_comm
+        network_bytes["inter_rack"] += tp_comm + pp_comm + moe_comm
 
     comm_limits: List[float] = []
     if network_bytes["intra"] > 0:
@@ -355,6 +419,7 @@ def evaluate_plan(
         "limit": limiting,
         "instances": instances_possible,
         "gpus_per_instance": gpus_per_instance,
+        "ep": ep,
         "tp": tp,
         "pp": pp,
         "memory_used": mem_usage,
@@ -380,6 +445,7 @@ def simulate_rack(
     quant_bits: Iterable[int],
     tp_candidates: Iterable[int],
     pp_candidates: Iterable[int],
+    ep_candidates: Iterable[int],
 ) -> Dict[int, Dict[int, Dict[str, float]]]:
     results: Dict[int, Dict[int, Dict[str, float]]] = {}
     for bits in quant_bits:
@@ -393,11 +459,13 @@ def simulate_rack(
                 for pp in pp_candidates:
                     if model.num_layers % pp != 0:
                         continue
-                    plan = evaluate_plan(rack, quant, model, batch, tp, pp, racks)
-                    if not plan:
-                        continue
-                    if not best or plan["total_tps"] > best["total_tps"]:
-                        best = plan
+                    eps = ep_candidates if model.is_moe else [1]
+                    for ep in eps:
+                        plan = evaluate_plan(rack, quant, model, batch, tp, pp, ep, racks)
+                        if not plan:
+                            continue
+                        if not best or plan["total_tps"] > best["total_tps"]:
+                            best = plan
             if best:
                 results[bits][batch] = best
     return results
@@ -480,7 +548,7 @@ def print_summary(rack: RackPreset, sim_results: Dict[int, Dict[int, Dict[str, f
         print(f"Notes: {rack.notes}")
 
     header = (
-        "  Batch | Quant | Tok/GPU(avg) | Inst TPS | Tot TPS | #Inst | GPUs/Inst | TPxPP | "
+        "  Batch | Quant | Tok/GPU(avg) | Inst TPS | Tot TPS | #Inst | GPUs/Inst | TPxPPxEP | "
         "Mem/GPU (GB) | Limit | Fabric Load per Inst (GB/s intra/inter/rack) | Bounds tok/GPU(avg) (comp/hbm/comm)"
     )
     print(header)
@@ -499,7 +567,7 @@ def print_summary(rack: RackPreset, sim_results: Dict[int, Dict[int, Dict[str, f
                 f"  {batch:5d} | {bits:5d} | {plan['tokens_per_gpu']:13.2f} | "
                 f"{plan['instance_tps']:10.2f} | {plan['total_tps']:10.1f} | "
                 f"{plan['instances']:5d} | {plan['gpus_per_instance']:9d} | "
-                f"{plan['tp']}x{plan['pp']} | {mem_gb:11.1f} | "
+                f"{plan['tp']}x{plan['pp']}x{plan['ep']} | {mem_gb:11.1f} | "
                 f"{plan['limit']:>6} | {intra_gbs:5.1f}/{inter_gbs:5.1f}/{rack_gbs:5.1f} | "
                 f"{format_bound(plan['compute_bound_per_gpu'])}/"
                 f"{format_bound(plan['hbm_bound_per_gpu'])}/"
@@ -510,10 +578,11 @@ def print_summary(rack: RackPreset, sim_results: Dict[int, Dict[int, Dict[str, f
 
 def main() -> None:
     racks = 8
-    batch_sizes = [4, 8, 16]
+    batch_sizes = [1, 2, 4, 8, 10, 12, 16]
     quant_bits = [4, 8, 16]
     tp_candidates = [1, 2, 4, 8, 12, 16, 24, 32]
     pp_candidates = [1, 2, 3, 4, 6, 8]
+    ep_candidates = [1, 2, 4, 8]
 
     print(f"Model: {MODEL.name} ({MODEL.num_params/1e9:.0f}B params)")
     print(f"Layers: {MODEL.num_layers}, hidden size: {MODEL.hidden_size}, heads: {MODEL.num_heads}")
@@ -533,6 +602,7 @@ def main() -> None:
             quant_bits=quant_bits,
             tp_candidates=tp_candidates,
             pp_candidates=pp_candidates,
+            ep_candidates=ep_candidates,
         )
         print_summary(rack, sim_results, racks)
         plot_path = plot_results(rack, sim_results, racks, plot_dir)
