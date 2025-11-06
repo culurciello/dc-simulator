@@ -1,13 +1,13 @@
 # Data-center AI cluster, rack simulator
 
 
-![](plots/amd_mi355x_oam_rack.png)
+![Inference results](plots/amd_mi355x_oam_rack_inference.png)
 
 A lightweight rack-scale throughput estimator for running an LLM at scale (Qwen3-235B) across
 multiple data-center compute racks. The Python simulator sweeps tensor/pipeline parallel
-plans, quantization (4/8/16 bit), and batch sizes (4w/8/16) for each hardware
-preset, then reports sustained decode throughput and the bottleneck (compute,
-HBM, or fabric).
+plans, quantization (4/8/16 bit), and batch sizes for each hardware preset, then reports the
+sustained throughput ceiling and the bottleneck (compute, HBM, or fabric) for both inference
+and training workloads.
 
 The current presets cover 8 racks of:
 - NVIDIA GB200 NVL72 cabinets
@@ -34,14 +34,33 @@ pip install numpy matplotlib
 
 ## Run
 
+
+#### Inference:
+
 ```bash
-python3 llm_cluster_simulator.py
+python3 llm_cluster_simulator.py --mode inference --batch-sizes "1,2,4,6,8,10,12,14,16" --quant-bits "4"
 ```
 
 The script prints a table per rack preset. Columns include the batch size,
 quantization, total rack throughput, per-instance throughput, optimal
 tensor/pipeline split, memory footprint per GPU, and the load each instance
 puts on intra-server, inter-server, and inter-rack fabrics.
+
+#### Training:
+
+Switch to training-mode sizing (forward/backward + optimizer traffic) with:
+
+```bash
+python3 llm_cluster_simulator.py --mode training --batch-sizes "8,16,32,64,96,128,192,256" --quant-bits "4"
+```
+
+Training summaries add per-instance and aggregate samples/sec (derived from
+steps/sec) plus data-parallel gradient load so you can gauge utilisation headroom
+on each fabric. Plots in this mode chart total samples processed per second.
+
+![training results](plots/amd_mi355x_oam_rack_training.png)
+
+
 
 ## Customising the model
 
@@ -54,11 +73,12 @@ Key constants live near the top of `llm_cluster_simulator.py`.
 - `QUANT_PRESETS`: adjust weight size, sustained compute scaling, or KV element
   size for different quantisation schemes.
 - `RACK_PRESETS`: add or tweak a rack by editing GPU counts and interconnect
-  bandwidths (bytes/sec).
+  link profiles (bandwidth in bytes/sec plus per-message latency in seconds).
 - `GPU_PRESETS`: change sustained FLOPs or HBM bandwidth to match benchmark
   data.
-- `batch_sizes`, `quant_bits`, `tp_candidates`, `pp_candidates`, `ep_candidates`:
-  space swept during auto-tuning.
+- `tp_candidates`, `pp_candidates`, `ep_candidates`: space swept during auto-tuning.
+  Batch sizes and quant options can be supplied at runtime via
+  `--batch-sizes` / `--quant-bits`.
 
 All bandwidth figures are “effective” sustained numbers; swap in values that
 match your kernels, NCCL configs, and traffic patterns.
@@ -80,12 +100,17 @@ match your kernels, NCCL configs, and traffic patterns.
 - `kv_bytes_per_elem`: assumes FP16 KV for 16-bit, FP8/INT8 for 8-bit, and
   FP8-with-compression for 4-bit variants. If you use paged attention or
   flash-decoding tweaks, swap in the measured per-element size instead.
-- Interconnect bandwidths (`intra_server_bw`, `inter_server_bw`, `inter_rack_bw`):
-  sourced from vendor topology guides (NVLink 5/NVSwitch, XGMI/IF-Links,
-  InfiniBand HDR/NDR optics). Enter the sustained per-direction bandwidth you
-  observe with NCCL collective microbenchmarks.
+- Interconnect links (`RackPreset.intra_server`, `RackPreset.inter_server`,
+  `RackPreset.inter_rack`): each link captures sustained bandwidth (bytes/s) and
+  per-message latency (seconds). Seed these with NCCL collective benchmarks and
+  latency telemetry for your fabric (NVLink/NVSwitch, XGMI/Infinity Fabric,
+  InfiniBand/roce). The simulator accounts for both throughput and handshake
+  latency when sizing communication ceilings.
 
 ### Qwen3 mixture-of-experts assumptions
+
+[Qwen3 architecture](https://magazine.sebastianraschka.com/p/qwen3-from-scratch)
+
 
 - Default settings assume a top-8-of-64 MoE layout (mirroring Qwen3’s release
   collateral). Adjust `experts_per_layer` and `active_experts` if you have an
@@ -108,9 +133,9 @@ match your kernels, NCCL configs, and traffic patterns.
 - **Tok/GPU(avg)**: cluster-average tokens/s per active GPU (total rack TPS /
   total active devices); use it to compare device-level efficiency across
   strategies.
-- **Inst TPS**: sustained tokens/sec for a single model instance given the
-  chosen tensor/pipeline split.
-- **Total TPS**: aggregate decode throughput for all 8 racks in the preset.
+- **Inst TPS** / **Total TPS**: sustained tokens/sec for a single model
+  instance and across all racks. In training mode the table also lists the
+  equivalent **Inst Steps/s** and **Tot Steps/s** to highlight optimiser pace.
 - **Limit**: which subsystem capped throughput (`compute`, `hbm`, `comm`).
 - **Bounds tok/GPU(avg)**: theoretical per-device ceilings (without utilisation
   scaling) derived from compute, HBM, and communication limits. If the reported
@@ -161,6 +186,21 @@ The “compute max bound” column is only a first‑order ceiling that we deriv
 
   In short, the ceiling is a modelling aid, not a hard limit enforced by physics. If your observed tok/GPU goes past it, update the sustained FLOP numbers or the MoE
   fractions to match your telemetry; the simulator will rescale accordingly.
+
+
+### Note 3:
+
+KV-cache offloading is one of the biggest architectural challenges in large-scale LLM inference (especially with multi-hundred-billion-parameter models like Qwen3-235B).
+
+You need to offload (move) part of the KV-cache to CPU memory or another storage tier when GPU memory capacity is insufficient to hold:
+
+- The entire model’s weights (which are read-only), plus
+- The active KV-cache for all tokens and all concurrent inference sessions.
+
+Typical scenarios include:
+
+- Long-context inference (e.g., 32 K, 128 K tokens) 
+KV-cache grows linearly with sequence length → can exceed 100 GB per context for very large models.
 
 
 ## Extending
