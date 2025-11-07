@@ -61,6 +61,15 @@ on each fabric. Plots in this mode chart total samples processed per second.
 ![training results](plots/amd_mi355x_oam_rack_training.png)
 
 
+#### KV-cache offloading:
+
+
+```
+python3 kv_offload_simulator.py
+```
+
+See `docs` for more info.
+
 
 ## Customising the model
 
