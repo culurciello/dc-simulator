@@ -2,7 +2,8 @@ from typing import Dict, List
 
 from GPU import GPUConfig
 from model import ModelConfig, QuantConfig
-from rack import RackPreset
+from rack import LinkProfile, RackPreset
+
 
 GPU_PRESETS: Dict[str, GPUConfig] = {
     "MI300X": GPUConfig(
@@ -38,19 +39,20 @@ RACK_PRESETS: List[RackPreset] = [
         gpu_key="GB200",
         gpus_per_server=8,
         servers_per_rack=9,
-        intra_server_bw=1.8e12,     # NVLink 5 per GPU
-        inter_server_bw=0.9e12,     # NVSwitch within NVL72
-        inter_rack_bw=0.45e12,      # InfiniBand / NVLink Switch System
-        notes="NVL cabinet with 9 servers x 8 GB200 GPUs.",
+        intra_server=LinkProfile(throughput=1.8e12, latency=1.2e-6),
+        inter_server=LinkProfile(throughput=0.9e12, latency=1.8e-6),
+        inter_rack=LinkProfile(throughput=0.45e12, latency=4.5e-6),
+        notes="NVL cabinet with 9 servers x 8 GB200 GPUs (host DRAM offload).",
+        kv_system_key="gb200_host",
     ),
     RackPreset(
         name="NVIDIA GB300 NVL72",
         gpu_key="GB300",
         gpus_per_server=8,
         servers_per_rack=9,
-        intra_server_bw=2.1e12,
-        inter_server_bw=1.05e12,
-        inter_rack_bw=0.6e12,
+        intra_server=LinkProfile(throughput=2.1e12, latency=1.0e-6),
+        inter_server=LinkProfile(throughput=0.9e12, latency=1.8e-6),
+        inter_rack=LinkProfile(throughput=0.45e12, latency=4.5e-6),
         notes="Future Blackwell-class NVL72 cabinet (estimates).",
     ),
     RackPreset(
@@ -58,9 +60,9 @@ RACK_PRESETS: List[RackPreset] = [
         gpu_key="MI300X",
         gpus_per_server=8,
         servers_per_rack=8,
-        intra_server_bw=0.95e12,    # XGMI (8 links, ~= 896 GB/s)
-        inter_server_bw=0.45e12,    # Infinity Fabric over optics
-        inter_rack_bw=0.25e12,      # IB/HDR or 400G-class optics
+        intra_server=LinkProfile(throughput=0.95e12, latency=1.8e-6),
+        inter_server=LinkProfile(throughput=0.45e12, latency=3.0e-6),
+        inter_rack=LinkProfile(throughput=0.25e12, latency=6.0e-6),
         notes="4U OAM trays with Infinity Fabric interconnect.",
     ),
     RackPreset(
@@ -68,9 +70,9 @@ RACK_PRESETS: List[RackPreset] = [
         gpu_key="MI355X",
         gpus_per_server=8,
         servers_per_rack=8,
-        intra_server_bw=1.2e12,
-        inter_server_bw=0.55e12,
-        inter_rack_bw=0.3e12,
+        intra_server=LinkProfile(throughput=1.2e12, latency=1.5e-6),
+        inter_server=LinkProfile(throughput=0.55e12, latency=2.5e-6),
+        inter_rack=LinkProfile(throughput=0.3e12, latency=5.5e-6),
         notes="Projected MI355X fabric improvements.",
     ),
 ]
@@ -83,18 +85,50 @@ QUANT_PRESETS: Dict[int, QuantConfig] = {
 }
 
 
-MODEL = ModelConfig(
-    name="Qwen3-235B-A22B",
-    num_params=235e9,
-    num_layers=94,
-    hidden_size=1536,
-    num_heads=64,
-    context_length=4096,  # up to 256K-token long-context understanding
-    generation_window=1024,
-    experts_per_layer=128,
-    active_experts=8,
-    expert_param_fraction=0.88,   # majority of params live in experts
-    shared_param_fraction=0.12,   # router + shared FFNs + attention
-    moe_dispatch_factor=2.0,      # send + gather
-)
+MODEL_PRESETS: Dict[str, ModelConfig] = {
+    "qwen3-235b-a22b": ModelConfig(
+        name="Qwen3-235B-A22B",
+        num_params=235e9,
+        num_layers=94,
+        hidden_size=1536,
+        num_heads=64,
+        context_length=4096,
+        generation_window=1024,
+        experts_per_layer=128,
+        active_experts=8,
+        expert_param_fraction=0.88,
+        shared_param_fraction=0.12,
+        moe_dispatch_factor=2.0,
+    ),
+    "deepseek-v3.2-exp-685b": ModelConfig(
+        name="DeepSeek-V3.2-Exp",
+        num_params=685e9,
+        num_layers=128,
+        hidden_size=2048,
+        num_heads=128,
+        context_length=8192,
+        generation_window=2048,
+        experts_per_layer=160,
+        active_experts=12,
+        expert_param_fraction=0.92,
+        shared_param_fraction=0.08,
+        moe_dispatch_factor=2.2,
+    ),
+    "chatgpt5-1p5t": ModelConfig(
+        name="ChatGPT5-1P5T",
+        num_params=1.5e12,
+        num_layers=160,
+        hidden_size=3072,
+        num_heads=192,
+        context_length=131072,
+        generation_window=32768,
+        experts_per_layer=256,
+        active_experts=24,
+        expert_param_fraction=0.94,
+        shared_param_fraction=0.06,
+        moe_dispatch_factor=2.4,
+    ),
+}
 
+
+MODEL = MODEL_PRESETS["qwen3-235b-a22b"]

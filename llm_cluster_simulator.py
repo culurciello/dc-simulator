@@ -27,7 +27,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from model import ModelConfig, QuantConfig
-from presets import GPU_PRESETS, MODEL, QUANT_PRESETS, RACK_PRESETS
+from presets import GPU_PRESETS, MODEL_PRESETS, QUANT_PRESETS, RACK_PRESETS
 from rack import RackPreset
 from utils import (
     batch_efficiency,
@@ -57,6 +57,17 @@ TRAIN_GRAD_MESSAGES = 1.0
 
 DEFAULT_INFERENCE_BATCHES = [1, 2, 4, 8, 10, 12, 16]
 DEFAULT_TRAIN_BATCHES = [32, 64, 96, 128, 256, 512]
+DEFAULT_QUANT_BITS = [4, 8, 16]
+PLOT_QUANT_BITS = [4, 8, 16]
+
+MODEL_SELECTION_ALIASES = {
+    "1": "qwen3-235b-a22b",
+    "qwen": "qwen3-235b-a22b",
+    "2": "deepseek-v3.2-exp-685b",
+    "deepseek": "deepseek-v3.2-exp-685b",
+    "3": "chatgpt5-1p5t",
+    "chatgpt": "chatgpt5-1p5t",
+}
 
 
 @dataclass
@@ -348,6 +359,7 @@ def plot_results(
     racks: int,
     output_dir: Path,
     mode: str,
+    model: ModelConfig,
 ) -> Optional[Path]:
     if not sim_results:
         return None
@@ -356,7 +368,9 @@ def plot_results(
     fig, ax = plt.subplots(figsize=(7, 4.5))
 
     plotted = False
-    for bits in sorted(sim_results.keys()):
+    for bits in PLOT_QUANT_BITS:
+        if bits not in sim_results:
+            continue
         batches = sorted(sim_results[bits].keys())
         if not batches:
             continue
@@ -377,7 +391,9 @@ def plot_results(
     gpu = GPU_PRESETS[rack.gpu_key]
     total_gpus = racks * rack.servers_per_rack * rack.gpus_per_server
 
-    ax.set_title(f"{rack.name}\n{gpu.name} - {total_gpus} GPUs across {racks} racks")
+    ax.set_title(
+        f"{rack.name} | {model.name}\n{gpu.name} - {total_gpus} GPUs across {racks} racks"
+    )
     ax.set_xlabel("Batch size")
     if mode.lower() == "training":
         ax.set_ylabel(f"Total samples/sec ({racks} racks, training)")
@@ -385,9 +401,18 @@ def plot_results(
         ax.set_ylabel(f"Total tokens/sec ({racks} racks)")
     ax.grid(True, alpha=0.2)
     ax.legend()
+    # fig.text(
+    #     0.02,
+    #     0.97,
+    #     f"Model: {model.name} | Params: {model.num_params/1e9:.0f}B | Layers: {model.num_layers} | Hidden: {model.hidden_size}",
+    #     fontsize=8,
+    #     ha="left",
+    #     va="top",
+    # )
 
     output_suffix = "training" if mode.lower() == "training" else "inference"
-    output_path = output_dir / f"{slugify(rack.name)}_{output_suffix}.png"
+    model_slug = slugify(model.name)
+    output_path = output_dir / f"{slugify(rack.name)}_{model_slug}_{output_suffix}.png"
     fig.tight_layout()
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
@@ -399,6 +424,7 @@ def print_summary(
     sim_results: Dict[int, Dict[int, Dict[str, float]]],
     racks: int,
     mode: str,
+    display_bits: Iterable[int],
 ) -> None:
     gpu = GPU_PRESETS[rack.gpu_key]
     total_gpus = racks * rack.servers_per_rack * rack.gpus_per_server
@@ -416,6 +442,13 @@ def print_summary(
         f"{rack.inter_server.latency * 1e6:.2f} us, "
         f"inter-rack={format_gbps(rack.inter_rack.throughput):.1f} GB/s @ "
         f"{rack.inter_rack.latency * 1e6:.2f} us"
+    )
+    storage_per_rack_tb = (
+        rack.storage_servers_per_rack * rack.storage_server_capacity_bytes / 1e12
+    )
+    print(
+        f"Storage per rack: {rack.storage_servers_per_rack} servers x "
+        f"{rack.storage_server_capacity_bytes/1e12:.0f} TB = {storage_per_rack_tb:.0f} TB"
     )
     if rack.notes:
         print(f"Notes: {rack.notes}")
@@ -439,7 +472,9 @@ def print_summary(
     print(header)
     print("-" * len(header))
 
-    for bits in sorted(sim_results.keys()):
+    for bits in sorted(set(display_bits)):
+        if bits not in sim_results:
+            continue
         batches = sim_results[bits]
         for batch in sorted(batches.keys()):
             plan = batches[batch]
@@ -510,6 +545,17 @@ def _parse_int_list(raw: Optional[str]) -> Optional[List[int]]:
     return values
 
 
+def _parse_model_choice(raw: str) -> str:
+    if raw in MODEL_PRESETS:
+        return raw
+    alias_key = raw.strip().lower()
+    if alias_key in MODEL_SELECTION_ALIASES:
+        return MODEL_SELECTION_ALIASES[alias_key]
+    raise argparse.ArgumentTypeError(
+        f"Unknown model '{raw}'. Use 1=qwen3-235b-a22b, 2=deepseek-v3.2-exp-685b, 3=chatgpt5-1p5t."
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Rack-level LLM simulator")
     parser.add_argument(
@@ -535,6 +581,13 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated list of quantisation bits (e.g. '4,8,16').",
     )
     parser.add_argument(
+        "--model",
+        choices=sorted(MODEL_PRESETS.keys()),
+        type=_parse_model_choice,
+        default="qwen3-235b-a22b",
+        help="Model preset to simulate (1=qwen, 2=deepseek, 3=chatGPT-like).",
+    )
+    parser.add_argument(
         "--skip-plots",
         action="store_true",
         help="Disable plot generation (useful on headless or slow environments).",
@@ -546,6 +599,7 @@ def main() -> None:
     args = parse_args()
     mode = args.mode.lower()
     racks = max(1, args.racks)
+    model = MODEL_PRESETS[args.model]
 
     custom_batches = _parse_int_list(args.batch_sizes)
     batch_sizes = (
@@ -555,7 +609,10 @@ def main() -> None:
     )
 
     custom_bits = _parse_int_list(args.quant_bits)
-    quant_bits = custom_bits if custom_bits else [4, 8, 16]
+    requested_bits = (
+        sorted(set(custom_bits)) if custom_bits else list(DEFAULT_QUANT_BITS)
+    )
+    quant_bits = sorted(set(requested_bits) | set(PLOT_QUANT_BITS))
 
     # tp is the tensor-parallel shard count (how many GPUs split each layer's weights)
     tp_candidates = [1, 2, 4, 8, 12, 16, 24, 32]
@@ -565,17 +622,17 @@ def main() -> None:
     ep_candidates = [1, 2, 4, 8]
 
     print(f"Mode: {mode}")
-    print(f"Model: {MODEL.name} ({MODEL.num_params/1e9:.0f}B params)")
+    print(f"Model: {model.name} ({model.num_params/1e9:.0f}B params)")
     print(
-        f"Layers: {MODEL.num_layers}, hidden size: {MODEL.hidden_size}, heads: {MODEL.num_heads}"
+        f"Layers: {model.num_layers}, hidden size: {model.hidden_size}, heads: {model.num_heads}"
     )
     if mode == "inference":
-        print(f"Context tokens cached: {MODEL.total_cached_tokens}")
+        print(f"Context tokens cached: {model.total_cached_tokens}")
     else:
-        print("Training context length per sample:", MODEL.context_length)
+        print("Training context length per sample:", model.context_length)
     print(f"Evaluating {racks} racks per preset.")
     print(f"Batch sizes: {batch_sizes}")
-    print(f"Quant bits: {quant_bits}")
+    print(f"Quant bits: {requested_bits}")
     print()
 
     plot_dir = Path("plots")
@@ -584,7 +641,7 @@ def main() -> None:
     for rack in RACK_PRESETS:
         sim_results = simulate_rack(
             rack=rack,
-            model=MODEL,
+            model=model,
             racks=racks,
             batch_sizes=batch_sizes,
             quant_bits=quant_bits,
@@ -593,10 +650,10 @@ def main() -> None:
             ep_candidates=ep_candidates,
             mode=mode,
         )
-        print_summary(rack, sim_results, racks, mode)
+        print_summary(rack, sim_results, racks, mode, requested_bits)
         if args.skip_plots:
             continue
-        plot_path = plot_results(rack, sim_results, racks, plot_dir, mode)
+        plot_path = plot_results(rack, sim_results, racks, plot_dir, mode, model)
         if plot_path:
             generated_plots.append((rack.name, plot_path))
 

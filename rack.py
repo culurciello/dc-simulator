@@ -1,4 +1,11 @@
 from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass(frozen=True)
+class LinkProfile:
+    throughput: float  # bytes/s of usable bandwidth
+    latency: float     # seconds of per-message latency
 
 
 @dataclass(frozen=True)
@@ -7,8 +14,10 @@ class RackPreset:
     gpu_key: str
     gpus_per_server: int
     servers_per_rack: int
-    intra_server_bw: float      # bytes/s (e.g., NVLink/XGMI)
-    inter_server_bw: float      # bytes/s (within rack, NVSwitch/IF link)
-    inter_rack_bw: float        # bytes/s (rack-to-rack optics/IB)
+    intra_server: LinkProfile   # intra-box fabric (NVLink/XGMI)
+    inter_server: LinkProfile   # within-rack fabric (NVSwitch/IF link)
+    inter_rack: LinkProfile     # rack-to-rack optics/IB
     notes: str = ""
-
+    kv_system_key: Optional[str] = None
+    storage_servers_per_rack: int = 2
+    storage_server_capacity_bytes: float = 122e12
