@@ -1,6 +1,7 @@
 from typing import Dict, List
 
 from GPU import GPUConfig
+from kv_subsystem import KVCacheSystem, KVComponent, KVSwitch
 from model import ModelConfig, QuantConfig
 from rack import LinkProfile, RackPreset
 
@@ -75,6 +76,19 @@ RACK_PRESETS: List[RackPreset] = [
         inter_rack=LinkProfile(throughput=0.3e12, latency=5.5e-6),
         notes="Projected MI355X fabric improvements.",
     ),
+    RackPreset(
+        name="NVIDIA Vera Rubin",
+        gpu_key="GB300",
+        gpus_per_server=12,
+        servers_per_rack=8,
+        intra_server=LinkProfile(throughput=2.5e12, latency=0.9e-6),
+        inter_server=LinkProfile(throughput=1.4e12, latency=1.5e-6),
+        inter_rack=LinkProfile(throughput=0.75e12, latency=3.5e-6),
+        notes="Speculative GB300-class Rubin inference pod (NVLink 6 fabric + denser sleds).",
+        kv_system_key="gb300_host",
+        storage_servers_per_rack=3,
+        storage_server_capacity_bytes=160e12,
+    ),
 ]
 
 
@@ -132,3 +146,91 @@ MODEL_PRESETS: Dict[str, ModelConfig] = {
 
 
 MODEL = MODEL_PRESETS["qwen3-235b-a22b"]
+
+
+def _build_plain_gb200_kv_system() -> KVCacheSystem:
+    cpu = KVComponent(
+        name="Grace CPU",
+        role="cpu",
+        memory_bytes=0.0,
+        link_bandwidth=512e9,
+        link_latency=500e-9,
+    )
+    gpu = KVComponent(
+        name="Hopper/GB200 GPU",
+        role="gpu",
+        memory_bytes=192e9,
+        link_bandwidth=900e9,
+        link_latency=350e-9,
+    )
+    kv_dram = KVComponent(
+        name="Host DRAM (CPU-attached)",
+        role="kv_dram",
+        memory_bytes=512e9,
+        link_bandwidth=512e9,
+        link_latency=500e-9,
+    )
+    switch = KVSwitch(
+        name="Grace Hopper NVLink/PCIe fabric",
+        fabric_bandwidth=512e9,
+        base_latency=250e-9,
+        kv_dma_bandwidth=546e9,
+    )
+    return KVCacheSystem(
+        cpu=cpu,
+        gpu=gpu,
+        kv_dram=kv_dram,
+        switch=switch,
+        label="Plain GB200 host-offload",
+    )
+
+
+def _build_gb300_host_kv_system() -> KVCacheSystem:
+    cpu = KVComponent(
+        name="Grace-Next CPU",
+        role="cpu",
+        memory_bytes=0.0,
+        link_bandwidth=800e9,
+        link_latency=400e-9,
+    )
+    gpu = KVComponent(
+        name="Blackwell/GB300 GPU",
+        role="gpu",
+        memory_bytes=228e9,
+        link_bandwidth=1.4e12,
+        link_latency=250e-9,
+    )
+    kv_dram = KVComponent(
+        name="Host DRAM (Grace-Next)",
+        role="kv_dram",
+        memory_bytes=1.0e12,
+        link_bandwidth=1.0e12,
+        link_latency=450e-9,
+    )
+    switch = KVSwitch(
+        name="NVLink 6 fabric",
+        fabric_bandwidth=1.2e12,
+        base_latency=200e-9,
+        kv_dma_bandwidth=1.2e12,
+    )
+    return KVCacheSystem(
+        cpu=cpu,
+        gpu=gpu,
+        kv_dram=kv_dram,
+        switch=switch,
+        label="Blackwell GB300 host-offload",
+    )
+
+
+KV_SYSTEM_PRESETS: Dict[str, KVCacheSystem] = {
+    "gb200_host": _build_plain_gb200_kv_system(),
+    "gb300_host": _build_gb300_host_kv_system(),
+}
+
+# Aliases are just human-friendly shortcuts that map to the canonical preset keys.
+KV_SYSTEM_ALIASES: Dict[str, str] = {
+    "plain": "gb200_host",
+    "host": "gb200_host",
+    "gb300": "gb300_host",
+    "rubin": "gb300_host",
+}

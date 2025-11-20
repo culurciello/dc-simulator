@@ -1,3 +1,4 @@
-plots/.DS_Store
+__pycache__/
+plots/
 .DS_Store
 *.pyc

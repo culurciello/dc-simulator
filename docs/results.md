@@ -126,6 +126,46 @@ KV DMA link (Plain GB200 host-offload): 0.0 GiB cached | util ≈ 0.0% of 512 GB
 ```
 
 
+Using a FIXED number of racks to increase utilization at the risk of delays for users:
+
+```
+ python3 dc_cluster_optimizer.py --active-users 1000 --model 3 --tokens-cached 128000 --fixed-racks 16 --batch-sizes "8"  --rack-preset "NVIDIA GB200 NVL72"                 
+
+Summary Table
+-----------------------------------------------------------
+Model                              ChatGPT5-1P5T
+Rack preset                        NVIDIA GB200 NVL72
+Quantisation                       8-bit
+Users supported (capacity)         1000 (288 slots, shortfall 712)
+KV system                          Plain GB200 host-offload
+Batch size per instance            8
+TP x PP x EP                       2 x 8 x 2
+Throughput demand / capacity       12000.0 / 62018.6 tok/s
+Servers needed                     144 (provisioned: 144)
+Racks needed                       16 of type NVIDIA GB200 NVL72
+Storage needed (TB)                125.83 TB KV tier
+Storage offloaded (TB)             53.35 TB outside GPU HBM
+Storage servers needed             1 (available 32)
+Storage capacity provisioned       3904.0 TB @ 2 per rack
+Batches per GPU                    0.25
+Networking between servers         NVSwitch / NVLink Switch
+Compute util (avg / p95)           19.3% / 21.1%
+Network util (avg / p95)           1.9% / 2.1%
+Storage util (avg / p95)           60.5% / 71.4%
+KV placement (HBM / cache / NVMe)  67500.0 GiB / 49687.5 GiB / 0.0 GiB
+KV reload latency (cache)          6.51 ms per user swap
+KV DMA util (avg / p95)            0.0% / 0.0% (512 GB/s link)
+WARNING: concurrency shortfall of 712 users. Increase rack count or reduce demand to avoid oversubscription.
+
+Plan details
+----------------------------------------
+Provisioned GPUs: 1152 (racks 16) | Active GPUs: 1152 | Instances running: 36/36 | Tokens/sec capacity: 62018.6
+Compute bound: 1722.7 tok/s per instance | HBM bound: 44773911.0 tok/s | Comm bound: 17401.5 tok/s
+KV DMA link (Plain GB200 host-offload): 49687.5 GiB cached | util ≈ 0.0% of 512 GB/s
+  Swap reload latency (cache): 6.51 ms per user
+```
+
+
 
 
 

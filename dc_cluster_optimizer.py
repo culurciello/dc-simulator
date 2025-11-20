@@ -35,6 +35,7 @@ from model import ModelConfig
 from presets import MODEL_PRESETS, QUANT_PRESETS, RACK_PRESETS
 from rack import RackPreset
 from utils import kv_bytes_per_token, human_gbytes, slugify
+from kv_subsystem import get_kv_system, kv_system_choices
 from dc_cluster_visualizer import render_cluster_diagram
 
 INFERENCE_KV_AMPLIFICATION = 1.1
@@ -75,21 +76,19 @@ def _rack_slug(name: str) -> str:
 
 
 def _find_rack_for_gpu(gpu_key: str, rack_choice: Optional[str]) -> RackPreset:
+    if rack_choice:
+        target_slug = _rack_slug(rack_choice)
+        target_name = rack_choice.strip().lower()
+        for rack in RACK_PRESETS:
+            if rack.name.lower() == target_name or _rack_slug(rack.name) == target_slug:
+                return rack
+        options = ", ".join(rack.name for rack in RACK_PRESETS)
+        raise ValueError(f"No rack preset named '{rack_choice}'. Available options: {options}")
+
     matches = [rack for rack in RACK_PRESETS if rack.gpu_key.lower() == gpu_key.lower()]
     if not matches:
         raise ValueError(f"No rack preset found for GPU '{gpu_key}'.")
-    if not rack_choice:
-        return matches[0]
-    target_slug = _rack_slug(rack_choice)
-    target_name = rack_choice.strip().lower()
-    for rack in matches:
-        if rack.name.lower() == target_name or _rack_slug(rack.name) == target_slug:
-            return rack
-    options = ", ".join(rack.name for rack in matches)
-    raise ValueError(
-        f"No rack preset named '{rack_choice}' for GPU '{gpu_key}'. "
-        f"Available options: {options}"
-    )
+    return matches[0]
 
 
 def _override_tokens(model: ModelConfig, total_cached_tokens: int) -> ModelConfig:
@@ -210,7 +209,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--quant-bits",
         type=int,
-        default=4,
+        default=8,
         choices=sorted(QUANT_PRESETS.keys()),
         help="Quantisation precision for serving weights.",
     )
@@ -224,7 +223,7 @@ def parse_args() -> argparse.Namespace:
         "--rack-preset",
         type=str,
         help=(
-            "Optional rack preset name/slug (e.g. 'nvidia_gb200_nvl72'). "
+            "Optional rack preset name/slug (e.g. 'NVIDIA GB200 NVL72'). "
             "Defaults to the first rack that matches --gpu."
         ),
     )
@@ -238,6 +237,22 @@ def parse_args() -> argparse.Namespace:
         "--batch-sizes",
         type=str,
         help="Comma-separated batch sizes to search (defaults to inference presets).",
+    )
+    parser.add_argument(
+        "--fixed-racks",
+        type=int,
+        help=(
+            "Force the optimizer to evaluate exactly this many racks, even if it undershoots the "
+            "requested concurrency / throughput. Useful for studying oversubscribed clusters."
+        ),
+    )
+    parser.add_argument(
+        "--prefer-utilization",
+        action="store_true",
+        help=(
+            "Select the rack plan that maximizes GPU compute utilization instead of peak throughput. "
+            "Useful when you want to keep clusters smaller and lean on KV offload."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -291,6 +306,8 @@ def _select_plan(
     batch_sizes: Iterable[int],
     required_users: int,
     required_tps: float,
+    prefer_utilization: bool,
+    allow_shortfall: bool,
 ) -> Optional[Tuple[int, Dict[str, float]]]:
     sim_results = simulate_rack(
         rack=rack,
@@ -307,16 +324,39 @@ def _select_plan(
         return None
 
     best_choice: Optional[Tuple[int, Dict[str, float]]] = None
+    best_metric: Optional[float] = None
     for batch in sorted(sim_results[quant_bits].keys()):
         plan = sim_results[quant_bits][batch]
         concurrency_capacity = plan["instances"] * batch
         total_capacity_tps = plan["total_tps"]
-        if concurrency_capacity < required_users:
-            continue
-        if total_capacity_tps < required_tps:
-            continue
-        if not best_choice or total_capacity_tps > best_choice[1]["total_tps"]:
-            best_choice = (batch, plan)
+        if not allow_shortfall:
+            if concurrency_capacity < required_users:
+                continue
+            if total_capacity_tps < required_tps:
+                continue
+        else:
+            if concurrency_capacity <= 0 or total_capacity_tps <= 0:
+                continue
+        if prefer_utilization and not allow_shortfall:
+            if total_capacity_tps <= 0:
+                continue
+            compute_util = required_tps / total_capacity_tps
+            utilization_score = compute_util
+            should_update = (
+                best_metric is None
+                or utilization_score > best_metric + 1e-9
+                or (
+                    math.isclose(utilization_score, best_metric, rel_tol=1e-9, abs_tol=1e-9)
+                    and total_capacity_tps < best_choice[1]["total_tps"]
+                )
+            )
+            if should_update:
+                best_metric = utilization_score
+                best_choice = (batch, plan)
+        else:
+            if not best_choice or total_capacity_tps > best_choice[1]["total_tps"]:
+                best_choice = (batch, plan)
+                best_metric = total_capacity_tps
     return best_choice
 
 
@@ -465,8 +505,19 @@ def main() -> None:
         required_users = max(required_users, stochastic_required)
         required_tps = required_users * tokens_per_user_rate
 
+    allow_shortfall = args.fixed_racks is not None
+    if args.fixed_racks is not None and args.fixed_racks < 1:
+        raise SystemExit("--fixed-racks must be >= 1.")
+    rack_counts: Iterable[int]
+    if args.fixed_racks is not None:
+        rack_counts = [args.fixed_racks]
+        if args.fixed_racks > args.max_racks:
+            args.max_racks = args.fixed_racks
+    else:
+        rack_counts = range(1, args.max_racks + 1)
+
     best_selection: Optional[Tuple[int, int, Dict[str, float]]] = None
-    for rack_count in range(1, args.max_racks + 1):
+    for rack_count in rack_counts:
         choice = _select_plan(
             rack=rack,
             model=model,
@@ -475,6 +526,8 @@ def main() -> None:
             batch_sizes=batch_sizes,
             required_users=required_users,
             required_tps=required_tps,
+            prefer_utilization=args.prefer_utilization,
+            allow_shortfall=allow_shortfall,
         )
         if choice:
             batch_size, plan = choice
@@ -495,6 +548,7 @@ def main() -> None:
         instances_available, max(1, math.ceil(required_users / batch_size))
     )
     gpus_required = max(gpus_per_instance, instances_required * gpus_per_instance)
+    throughput_capacity = plan["total_tps"]
     servers_needed = math.ceil(gpus_required / rack.gpus_per_server)
     racks_computed = math.ceil(servers_needed / rack.servers_per_rack)
     per_rack_gpu_capacity = rack.servers_per_rack * rack.gpus_per_server
@@ -515,6 +569,8 @@ def main() -> None:
     storage_util_samples = [
         min(1.0, (kv_usage_total * scale) / kv_capacity_total) for scale in scenario_scales
     ]
+    concurrency_shortfall = max(0, required_users - concurrency_capacity)
+    throughput_shortfall = max(0.0, required_tps - throughput_capacity)
 
     kv_profile = _compute_kv_profile(
         required_users=required_users,
@@ -592,11 +648,21 @@ def main() -> None:
     network_type = _network_label(plan)
 
     kv_label = kv_system.label if kv_system else "Host DRAM / NVMe spill"
+    user_capacity_text = f"{required_users} ({concurrency_capacity} slots"
+    if concurrency_shortfall > 0:
+        user_capacity_text += f", shortfall {concurrency_shortfall}"
+    user_capacity_text += ")"
+    throughput_text = (
+        f"{required_tps:.1f} / {throughput_capacity:.1f} tok/s"
+    )
+    if throughput_shortfall > 0:
+        throughput_text += f" (shortfall {throughput_shortfall:.1f})"
+
     rows: List[Tuple[str, str]] = [
         ("Model", model.name),
         ("Rack preset", rack.name),
         ("Quantisation", f"{quant_bits}-bit"),
-        ("Users supported (capacity)", f"{required_users} ({concurrency_capacity} slots)"),
+        ("Users supported (capacity)", user_capacity_text),
         ("KV system", kv_label),
     ]
     if arrival_stats:
@@ -619,6 +685,7 @@ def main() -> None:
                 "TP x PP x EP",
                 f"{plan['tp']} x {plan['pp']} x {plan['ep']}",
             ),
+            ("Throughput demand / capacity", throughput_text),
             (
                 "Servers needed",
                 f"{servers_needed} (provisioned: {racks_needed * rack.servers_per_rack})",
@@ -690,6 +757,16 @@ def main() -> None:
             )
         )
     _print_summary_table(rows)
+    if concurrency_shortfall > 0:
+        print(
+            f"WARNING: concurrency shortfall of {concurrency_shortfall} users."
+            " Increase rack count or reduce demand to avoid oversubscription."
+        )
+    if throughput_shortfall > 0:
+        print(
+            f"WARNING: throughput shortfall of {throughput_shortfall:.1f} tokens/sec "
+            "relative to requested workload."
+        )
     if storage_shortfall > 0:
         deficit_tb = storage_shortfall * storage_capacity_tb
         print(

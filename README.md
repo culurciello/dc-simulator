@@ -58,39 +58,39 @@ Parameters:
 - tokens cache needed
 - servers used
 
-```
-python3 dc_cluster_optimizer.py --active-users 1000 --model 3 --tokens-cached 128000 --max-racks 64 --batch-sizes "1,2,4,8"  --rack-preset "NVIDIA GB200 NVL72 "
-```
-
-Output:
+Example run and output:
 
 ```
-$ python dc_cluster_optimizer.py --active-users 8000 --model 1 --tokens-cached 128000 --quant-bits 16 --max-racks 128 --batch-sizes "1,2,4,8"  --rack-preset "NVIDIA GB200 NVL72"
+$ python3 dc_cluster_optimizer.py --active-users 1000 --model 3 --tokens-cached 128000 --max-racks 64 --batch-sizes "1,2,4,8"  --rack-preset "NVIDIA GB200 NVL72 "
 
 Summary Table
 -----------------------------------------------------------
-Model                              Qwen3-235B-A22B
+Model                              ChatGPT5-1P5T
 Rack preset                        NVIDIA GB200 NVL72
-Quantisation                       16-bit
-Users supported (capacity)         8000 (8064 slots)
+Quantisation                       8-bit
+Users supported (capacity)         1000 (1008 slots)
 KV system                          Plain GB200 host-offload
 Batch size per instance            8
-TP x PP x EP                       4 x 2 x 1
-Servers needed                     1000 (provisioned: 1008)
-Racks needed                       112 of type NVIDIA GB200 NVL72
-Storage needed (TB)                591.40 TB KV tier
-Batches per GPU                    1.00
+TP x PP x EP                       12 x 1 x 2
+Throughput demand / capacity       12000.0 / 162798.9 tok/s
+Servers needed                     375 (provisioned: 378)
+Racks needed                       42 of type NVIDIA GB200 NVL72
+Storage needed (TB)                125.83 TB KV tier
+Storage offloaded (TB)             0.00 TB outside GPU HBM
+Storage servers needed             0 (available 84)
+Storage capacity provisioned       10248.0 TB @ 2 per rack
+Batches per GPU                    0.33
 Networking between servers         NVSwitch / NVLink Switch
-Compute util (avg / p95)           4.6% / 5.0%
-Network util (avg / p95)           1.2% / 1.3%
-Storage util (avg / p95)           77.9% / 85.0%
-KV placement (HBM / cache / NVMe)  550781.2 GiB / 0.0 GiB / 0.0 GiB
+Compute util (avg / p95)           7.4% / 8.0%
+Network util (avg / p95)           6.2% / 6.7%
+Storage util (avg / p95)           91.9% / 100.0%
+KV placement (HBM / cache / NVMe)  234375.0 GiB / 0.0 GiB / 0.0 GiB
 KV DMA util (avg / p95)            0.0% / 0.0% (512 GB/s link)
 
 Plan details
 ----------------------------------------
-Provisioned GPUs: 8064 (racks 112) | Active GPUs: 8000 | Instances running: 1000/1008 | Tokens/sec capacity: 2094188.9
-Compute bound: 2077.6 tok/s per instance | HBM bound: 38105456.2 tok/s | Comm bound: 7881.7 tok/s
+Provisioned GPUs: 3024 (racks 42) | Active GPUs: 3000 | Instances running: 125/126 | Tokens/sec capacity: 162798.9
+Compute bound: 1292.1 tok/s per instance | HBM bound: 33580433.2 tok/s | Comm bound: 1539.8 tok/s
 KV DMA link (Plain GB200 host-offload): 0.0 GiB cached | util ≈ 0.0% of 512 GB/s
 ```
 
@@ -100,6 +100,45 @@ Also:
 - Plots of optimal configuration and +/- 10% more or less batch size
 - Plots of optimal configuration and +/- 10% more or less tokens cached
 
+
+Note: to utilize less GPU and racks and more KV cache and resources, use:
+
+```
+$    python3 dc_cluster_optimizer.py --active-users 1000 --model 3 --tokens-cached 128000 --batch-sizes 8 --fixed-racks 16
+
+Summary Table
+-----------------------------------------------------------
+Model                              ChatGPT5-1P5T
+Rack preset                        NVIDIA GB200 NVL72
+Quantisation                       8-bit
+Users supported (capacity)         1000 (288 slots, shortfall 712)
+KV system                          Plain GB200 host-offload
+Batch size per instance            8
+TP x PP x EP                       2 x 8 x 2
+Throughput demand / capacity       12000.0 / 62018.6 tok/s
+Servers needed                     144 (provisioned: 144)
+Racks needed                       16 of type NVIDIA GB200 NVL72
+Storage needed (TB)                125.83 TB KV tier
+Storage offloaded (TB)             53.35 TB outside GPU HBM
+Storage servers needed             1 (available 32)
+Storage capacity provisioned       3904.0 TB @ 2 per rack
+Batches per GPU                    0.25
+Networking between servers         NVSwitch / NVLink Switch
+Compute util (avg / p95)           19.3% / 21.1%
+Network util (avg / p95)           1.9% / 2.1%
+Storage util (avg / p95)           60.5% / 71.4%
+KV placement (HBM / cache / NVMe)  67500.0 GiB / 49687.5 GiB / 0.0 GiB
+KV reload latency (cache)          6.51 ms per user swap
+KV DMA util (avg / p95)            0.0% / 0.0% (512 GB/s link)
+WARNING: concurrency shortfall of 712 users. Increase rack count or reduce demand to avoid oversubscription.
+
+Plan details
+----------------------------------------
+Provisioned GPUs: 1152 (racks 16) | Active GPUs: 1152 | Instances running: 36/36 | Tokens/sec capacity: 62018.6
+Compute bound: 1722.7 tok/s per instance | HBM bound: 44773911.0 tok/s | Comm bound: 17401.5 tok/s
+KV DMA link (Plain GB200 host-offload): 49687.5 GiB cached | util ≈ 0.0% of 512 GB/s
+  Swap reload latency (cache): 6.51 ms per user
+```
 
 
 ### Simulator with specified parameters:
@@ -165,12 +204,3 @@ python3 kv_offload_simulator.py --model deepseek-v3.2-exp-685b --batch-size 4 --
 4. Throughput estimation: the simulator computes three ceilings per instance: compute (sustained FLOPs, factoring active experts), HBM (KV read bandwidth), and communication (tensor/pipeline collectives plus MoE dispatch). Batch size influences kernel efficiency via an empirical scaling curve.
 5. Instance aggregation: the minimum of the three ceilings becomes the instance tokens/sec. We multiply by the number of instances that fit in N racks to get rack-wide throughput and record which subsystem bottlenecks.
 6. Reporting and plots: for each rack we print the optimal configuration per batch/quant and plot figures.
-
-
-
-## upgrades / to-do list
-
-- Add prefill modelling by sizing activation footprints and read/write bursts.
-- Because the simulator assumes steady-state decode, prefill/first-token latency is not modelled. Prefill-heavy workloads typically shift bottlenecks toward HBM or interconnect.
-- Introduce heterogeneous racks by instantiating multiple `simulate_rack` calls with different rack counts.
-- Emit CSV/JSON by adapting `print_summary` or plugging the returned dict into your own reporting layer.

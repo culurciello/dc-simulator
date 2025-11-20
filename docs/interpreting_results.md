@@ -76,3 +76,89 @@ pipeline boundaries and MoE dispatch barely touch the inter-rack links. For the 
 If you swapped every fabric link to 400 GbE (≈50 GB/s usable) you’d lower both inter-server and inter-rack throughput by ~18× compared to NVLink/NVSwitch (0.9 TB/s nominal). Utilization numbers would jump proportionally: a plan that currently reports ~1% network util would look more like 18–20%, and multi-stage plans could become comm-bound because the per-token
 latency would also rise (Ethernet microseconds vs NVSwitch sub-µs). You’d likely need to cut tensor/pipeline degrees or add racks to keep the same throughput. So while the raw utilization seems low today, it’s a direct result of fast fabrics;
 replacing them with 400 GbE would make comm the bottleneck for these workloads.
+
+
+#### Note 5:
+
+Question: in the simualtor: python3 dc_cluster_optimizer.py --active-users 1000 --model 3 --tokens-cached 128000 --max-racks 96
+  --batch-sizes 8 --> if I add more users, why is that more nodes are added and nobody KV cache is sent to cache?
+  
+  
+Answer: • Why Scaling Adds Nodes
+
+  - _select_plan keeps increasing the rack count until a plan’s instances * batch_size can host all concurrent users and
+    deliver the requested tokens/s (dc_cluster_optimizer.py:469-507). For your command the chosen plan uses 12 GPUs/instance
+    and batch 8, so 1,000 users need 125 instances ⇒ 1,500 GPUs ⇒ 21 NVL72 racks. If you request even more users, the loop
+    simply provisions additional copies of that instance layout, so the simulator reports more nodes.
+
+  Why KV Cache Never Leaves HBM
+
+  - The KV profile computes how much KV data must live in GPU memory versus the remote tier (dc_cluster_optimizer.py:111-
+    175). It first multiplies per-GPU KV usage from the plan’s memory breakdown by the number of active GPUs to get
+    total_hbm_bytes (plan["memory_breakdown"]["kv_cache"] * active_gpus). Only if the total KV demand from all users exceeds
+    that number will it spill to the external KV system.
+  - Per-GPU KV usage itself is sized to hold model.total_cached_tokens * batch_size tokens entirely in HBM (utils.py:101-
+    120). When you increase active users, the optimizer adds more instances/GPUs, so total_hbm_bytes grows in lockstep
+    with total_kv_bytes. The remaining = max(0, total_kv_bytes - total_hbm_bytes) term therefore stays at zero, and
+    _compute_kv_profile never allocates bytes to total_cache_bytes or total_nvme_bytes.
+  - That’s why the summary shows Storage offloaded (TB): 0.00 and KV placement: 87890.6 GiB / 0.0 GiB / 0.0 GiB: the added
+    GPUs bring enough aggregate HBM to store every user’s 128k-token cache locally, so there’s nothing to push to the
+    external KV tier.
+
+  Next Steps
+
+  1. To observe cache traffic, constrain the hardware so total_kv_bytes can exceed GPU HBM—e.g., cap --max-racks, manually
+     pick a smaller rack preset, or bump --tokens-cached far higher so each instance’s per-GPU KV share no longer fits.
+  2. Alternatively, modify the planner if you want to force KV overflow to the external tier even when local HBM is
+     available.
+     
+     
+Question:
+ › but the users are stocastich ano not all of them need to be on, in fact many log in every few minutes, and GPU can do more
+  in between those times. Please tell me what is the average active users?
+
+
+Answer:
+
+-  The command you ran doesn’t model stochastic arrivals at all—it simply treats --active-users 1000 as “1,000 concurrent
+  users are on every second.” So in that run the average active users is exactly 1,000 by definition.
+
+  If you want the simulator to compute the average that results from people logging in, idling, and leaving, pass both
+  --arrival-rate (new users per minute) and --avg-session-min (average session length). With those two flags the code
+  switches to the arrival model (simulate_active_users in dc_cluster_optimizer.py:393-424), prints a line like Arrival
+  model (mean/p95/max) in the summary, and then sizes the cluster for the higher of --active-users and the simulated p95
+  concurrency. Without those inputs it has no information about the distribution of user arrivals, so it can’t report an
+  average different from the --active-users target.
+
+
+-  You can already inject that stochastic view—the optimizer just needs the arrival inputs so it can size to the p95
+  concurrency rather than the raw --active-users. Try something like:
+
+  python3 dc_cluster_optimizer.py \
+    --active-users 1000 \
+    --arrival-rate 60 \
+    --avg-session-min 5 \
+    --model 3 \
+    --tokens-cached 128000 \
+    --max-racks 96 \
+    --batch-sizes 8
+
+  With both --arrival-rate and --avg-session-min, simulate_active_users runs a Poisson/exponential arrival model
+  (dc_cluster_optimizer.py:393-468). The summary will then show Arrival model (mean/p95/max) and the optimizer will size the
+  cluster to the larger of:
+
+  - your deterministic target (--active-users), and
+  - the simulated p95 active users derived from the arrival model.
+
+  If the arrival model’s p95 is below the steady 1,000 target, racks won’t drop—you’ve explicitly asked to handle
+  1,000 simultaneous users. To “use fewer racks,” lower --active-users and rely on the stochastic numbers, or make the
+  deterministic target track the same percentile (e.g., set --active-users to the expected mean and let the arrival simulator
+  guard you up to p95).
+
+  About triggering KV cache usage: you need a situation where aggregate KV demand exceeds what GPU HBM can hold. That can
+  happen if the stochastic p95 is high enough while you cap racks (so HBM can’t scale), or if you increase --tokens-cached
+  per user. Otherwise the solver keeps adding instances to meet the concurrency, and those extra GPUs bring enough HBM to
+  hold every user’s cache locally, so offload never engages.
+
+  So: feed the stochastic inputs, adjust the deterministic target to match your operational percentile, and optionally cap
+  racks or raise per-user KV so the run actually needs the external KV tier.
