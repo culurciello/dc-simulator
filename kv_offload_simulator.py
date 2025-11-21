@@ -45,9 +45,11 @@ from kv_subsystem import (
 )
 from utils import (
     batch_efficiency,
+    DEFAULT_HBM_RESIDENCY,
     fits_memory,
     human_gbytes,
     kv_bytes_per_token,
+    NVME_FALLBACK_BANDWIDTH,
 )
 
 INFERENCE_KV_AMPLIFICATION = 1.1
@@ -127,7 +129,7 @@ def parse_single_token(arg: str) -> int:
 def parse_kv_system_keys(arg: str) -> List[str]:
     entries = [item.strip().lower() for item in arg.split(",") if item.strip()]
     if not entries:
-        return [resolve_kv_system_key("plain")]
+        return [resolve_kv_system_key("gb200_plain")]
     resolved: List[str] = []
     for entry in entries:
         try:
@@ -156,18 +158,27 @@ def simulate_offload(
     model: ModelConfig,
     quant: QuantConfig,
     kv_system: KVCacheSystem,
+    hbm_residency: float,
 ) -> List[OffloadResult]:
     gpu = GPU_PRESETS["GB200"]
     gpus_per_instance = tp * pp * max(ep, 1)
     kv_capacity_bytes = kv_system.kv_capacity_bytes
     kv_dma_path = kv_system.path("gpu", "kv_dram")
+    residency = max(0.0, min(hbm_residency, 1.0))
 
     results: List[OffloadResult] = []
 
     for tokens in tokens_list:
         model_variant = replace(model, context_length=tokens, generation_window=0)
         mem_ok, _, breakdown = fits_memory(
-            gpu, model_variant, quant, tp=tp, pp=pp, ep=ep, batch_size=batch_size
+            gpu,
+            model_variant,
+            quant,
+            tp=tp,
+            pp=pp,
+            ep=ep,
+            batch_size=batch_size,
+            hbm_residency=residency,
         )
 
         kv_total = kv_bytes_per_token(model_variant, quant)
@@ -178,11 +189,12 @@ def simulate_offload(
         weights = breakdown["weights"]
         overhead = breakdown["overhead"]
         available_kv_bytes = max(0.0, limit - weights - overhead)
+        max_resident_tokens = tokens_cached * residency
 
         if kv_per_gpu > 0:
-            tokens_on_gpu = min(tokens_cached, available_kv_bytes / kv_per_gpu)
+            tokens_on_gpu = min(max_resident_tokens, available_kv_bytes / kv_per_gpu)
         else:
-            tokens_on_gpu = tokens_cached
+            tokens_on_gpu = max_resident_tokens
 
         tokens_offloaded = max(0.0, tokens_cached - tokens_on_gpu)
         offload_fraction = (
@@ -196,8 +208,16 @@ def simulate_offload(
         compute_bound = (gpus_per_instance * gpu_total_flops) / flops_per_token
         compute_tps = compute_bound * eff
 
-        hbm_per_token = kv_per_gpu * INFERENCE_KV_AMPLIFICATION
-        hbm_bound = gpu.hbm_bw / hbm_per_token if hbm_per_token > 0 else float("inf")
+        kv_hbm = kv_per_gpu * residency * INFERENCE_KV_AMPLIFICATION
+        kv_remote = (
+            kv_per_gpu * (1.0 - residency) * INFERENCE_KV_AMPLIFICATION
+        )
+        remote_bw = kv_dma_path.bandwidth_bytes or NVME_FALLBACK_BANDWIDTH
+
+        hbm_time = kv_hbm / gpu.hbm_bw if kv_hbm > 0 else 0.0
+        remote_time = kv_remote / remote_bw if kv_remote > 0 else 0.0
+        access_time = hbm_time + remote_time
+        hbm_bound = 1.0 / access_time if access_time > 0 else float("inf")
         hbm_tps = hbm_bound * eff
 
         tokens_per_sec_instance = min(compute_tps, hbm_tps)
@@ -261,6 +281,7 @@ def print_results(
     model: ModelConfig,
     quant_bits: int,
     kv_system: KVCacheSystem,
+    hbm_residency: float,
 ) -> None:
     gpu = GPU_PRESETS["GB200"]
     params_str = f"{model.num_params/1e9:.1f}B"
@@ -279,6 +300,9 @@ def print_results(
                 total_mem_gib, usable_mem_gib, available_mem_gib
             )
         )
+    print(
+        f"KV residency in HBM: {hbm_residency*100:.0f}% (phased users; remainder offloaded)"
+    )
     print(
         "Model parameters: {} | Decode batch size per GPU: {}".format(
             params_str, batch_size
@@ -642,6 +666,15 @@ def parse_args() -> argparse.Namespace:
         help="Quantisation precision for weights + KV cache (default: 16).",
     )
     parser.add_argument(
+        "--hbm-residency",
+        type=float,
+        default=DEFAULT_HBM_RESIDENCY,
+        help=(
+            "Fraction of cached tokens kept resident in HBM at steady state (0-1). "
+            "Remaining tokens are phased to system memory/NVMe. Default 0.50."
+        ),
+    )
+    parser.add_argument(
         "--tp",
         type=int,
         default=1,
@@ -712,6 +745,7 @@ def main() -> None:
     tokens = parse_tokens(args.tokens)
     model = MODEL_PRESETS[args.model]
     quant = QUANT_PRESETS[args.quant_bits]
+    hbm_residency = max(0.0, min(args.hbm_residency, 1.0))
     try:
         kv_system_keys = parse_kv_system_keys(args.kv_systems)
     except ValueError as exc:
@@ -728,7 +762,15 @@ def main() -> None:
             print()
         print(f"=== {kv_system.label} ===")
         results = simulate_offload(
-            tokens, args.batch_size, args.tp, args.pp, args.ep, model, quant, kv_system
+            tokens,
+            args.batch_size,
+            args.tp,
+            args.pp,
+            args.ep,
+            model,
+            quant,
+            kv_system,
+            hbm_residency,
         )
         print_results(
             results,
@@ -740,6 +782,7 @@ def main() -> None:
             model,
             args.quant_bits,
             kv_system,
+            hbm_residency,
         )
         comparison_payloads.append((system_key, results, kv_system))
         if args.random_swap:
@@ -758,6 +801,7 @@ def main() -> None:
                 qwen_model,
                 quant,
                 kv_system,
+                hbm_residency,
             )[0]
             deepseek_res = simulate_offload(
                 [swap_token_value],
@@ -768,6 +812,7 @@ def main() -> None:
                 deepseek_model,
                 quant,
                 kv_system,
+                hbm_residency,
             )[0]
             print(
                 f"\n[{kv_system.label}] Random user swap simulation @ {format_tokens(swap_token_value)} tokens "

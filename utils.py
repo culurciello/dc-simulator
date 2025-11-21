@@ -5,6 +5,11 @@ from typing import Dict, Tuple
 from GPU import GPUConfig
 from model import ModelConfig, QuantConfig
 
+# Fraction of each user's KV cache kept resident in HBM at steady state.
+DEFAULT_HBM_RESIDENCY = 0.5
+# Per-GPU fallback bandwidth when KV cache spills past host DRAM into NVMe.
+NVME_FALLBACK_BANDWIDTH = 32e9
+
 BYTES_PER_ACTIVATION = 2.0  # assume fp16 activations for comm + stash
 TRAIN_ACTIVATION_STASH = 2.5  # multiplier to cover checkpoints + backward buffers
 TRAIN_OPTIMIZER_MULT = 2.0    # Adam moments (m, v) alongside weights
@@ -106,13 +111,17 @@ def fits_memory(
     pp: int,
     ep: int,
     batch_size: int,
+    hbm_residency: float = 1.0,
     safety_margin: float = 0.15,
 ) -> Tuple[bool, float, Dict[str, float]]:
     weights_per_gpu = _weights_per_gpu(model, quant, tp, pp, ep)
 
     kv_per_token = kv_bytes_per_token(model, quant) / (tp * pp)
     tokens_cached = model.total_cached_tokens * batch_size
-    kv_cache = kv_per_token * tokens_cached
+    residency = max(0.0, min(hbm_residency, 1.0))
+    kv_cache_total = kv_per_token * tokens_cached
+    kv_cache = kv_cache_total * residency
+    kv_cache_remote = max(0.0, kv_cache_total - kv_cache)
 
     other_overhead = 0.05 * gpu.max_mem_bytes  # activations, optimizer states (small for inference)
     total_usage = weights_per_gpu + kv_cache + other_overhead
@@ -121,6 +130,8 @@ def fits_memory(
     breakdown = {
         "weights": weights_per_gpu,
         "kv_cache": kv_cache,
+        "kv_cache_remote": kv_cache_remote,
+        "kv_residency": residency,
         "overhead": other_overhead,
         "limit": limit,
     }

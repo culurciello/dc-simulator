@@ -26,10 +26,13 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 
+from kv_subsystem import get_kv_system
 from model import ModelConfig, QuantConfig
 from presets import GPU_PRESETS, MODEL_PRESETS, QUANT_PRESETS, RACK_PRESETS
 from rack import RackPreset
 from utils import (
+    DEFAULT_HBM_RESIDENCY,
+    NVME_FALLBACK_BANDWIDTH,
     batch_efficiency,
     CommPattern,
     fits_memory,
@@ -97,6 +100,8 @@ def evaluate_plan(
     ep: int,
     racks: int,
     mode: str,
+    kv_system=None,
+    hbm_residency: float = DEFAULT_HBM_RESIDENCY,
 ) -> Optional[Dict[str, float]]:
     if model.num_layers % pp != 0 or model.num_heads % tp != 0:
         return None
@@ -113,13 +118,15 @@ def evaluate_plan(
     if gpus_per_instance > total_gpus:
         return None
 
+    residency = max(0.0, min(hbm_residency, 1.0))
+
     if training:
         mem_ok, mem_usage, mem_breakdown = fits_training_memory(
             gpu, model, quant, tp, pp, ep, batch_size
         )
     else:
         mem_ok, mem_usage, mem_breakdown = fits_memory(
-            gpu, model, quant, tp, pp, ep, batch_size
+            gpu, model, quant, tp, pp, ep, batch_size, hbm_residency=residency
         )
     if not mem_ok:
         return None
@@ -137,11 +144,29 @@ def evaluate_plan(
         base_bytes = training_activation_bytes_per_token(model, tp, pp)
         hbm_per_token = base_bytes * TRAIN_HBM_MULT
     else:
-        hbm_per_token = kv_bytes_per_token(model, quant) / (tp * pp)
-        hbm_per_token *= INFERENCE_KV_AMPLIFICATION  # read amplification (cache misses, paging)
-    if hbm_per_token <= 0:
+        kv_per_token_total = kv_bytes_per_token(model, quant) / (tp * pp)
+        kv_per_token_hbm = kv_per_token_total * residency
+        kv_per_token_remote = max(0.0, kv_per_token_total - kv_per_token_hbm)
+        kv_per_token_hbm *= INFERENCE_KV_AMPLIFICATION  # read amplification (cache misses, paging)
+        kv_per_token_remote *= INFERENCE_KV_AMPLIFICATION
+
+        remote_bw = None
+        if kv_system:
+            remote_bw = kv_system.path("gpu", "kv_dram").bandwidth_bytes
+        if not remote_bw or remote_bw <= 0.0:
+            remote_bw = NVME_FALLBACK_BANDWIDTH
+
+        hbm_time = kv_per_token_hbm / gpu.hbm_bw if kv_per_token_hbm > 0 else 0.0
+        remote_time = (
+            kv_per_token_remote / remote_bw if kv_per_token_remote > 0 else 0.0
+        )
+        access_time = hbm_time + remote_time
+        hbm_per_token = kv_per_token_total
+    if training:
+        access_time = hbm_per_token / gpu.hbm_bw if hbm_per_token > 0 else 0.0
+    if access_time <= 0:
         return None
-    hbm_bound = gpu.hbm_bw / hbm_per_token
+    hbm_bound = 1.0 / access_time
     hbm_tps = hbm_bound * eff
 
     # Communication-bound
@@ -264,6 +289,8 @@ def evaluate_plan(
     comm_bound_raw = min(comm_limits_raw) if comm_limits_raw else float("inf")
     comm_bound_per_gpu = comm_bound_raw / gpus_per_instance
 
+    kv_remote_fraction = 0.0 if training else max(0.0, 1.0 - residency)
+
     tokens_per_step = batch_size * model.context_length if training else None
     steps_per_sec = 0.0
     total_steps_per_sec = 0.0
@@ -306,6 +333,8 @@ def evaluate_plan(
         "compute_bound_per_gpu": compute_bound_per_gpu,
         "hbm_bound_per_gpu": hbm_bound_per_gpu,
         "comm_bound_per_gpu": comm_bound_per_gpu,
+        "kv_residency": residency,
+        "kv_remote_fraction": kv_remote_fraction,
         "mode": mode,
         "dp_degree": dp_degree,
         "steps_per_sec": steps_per_sec if training else None,
@@ -326,6 +355,8 @@ def simulate_rack(
     pp_candidates: Iterable[int],
     ep_candidates: Iterable[int],
     mode: str,
+    kv_system=None,
+    hbm_residency: float = DEFAULT_HBM_RESIDENCY,
 ) -> Dict[int, Dict[int, Dict[str, float]]]:
     results: Dict[int, Dict[int, Dict[str, float]]] = {}
     for bits in quant_bits:
@@ -342,7 +373,17 @@ def simulate_rack(
                     eps = ep_candidates if model.is_moe else [1]
                     for ep in eps:
                         plan = evaluate_plan(
-                            rack, quant, model, batch, tp, pp, ep, racks, mode
+                            rack,
+                            quant,
+                            model,
+                            batch,
+                            tp,
+                            pp,
+                            ep,
+                            racks,
+                            mode,
+                            kv_system=kv_system,
+                            hbm_residency=hbm_residency,
                         )
                         if not plan:
                             continue
@@ -425,6 +466,7 @@ def print_summary(
     racks: int,
     mode: str,
     display_bits: Iterable[int],
+    hbm_residency: float,
 ) -> None:
     gpu = GPU_PRESETS[rack.gpu_key]
     total_gpus = racks * rack.servers_per_rack * rack.gpus_per_server
@@ -449,6 +491,9 @@ def print_summary(
     print(
         f"Storage per rack: {rack.storage_servers_per_rack} servers x "
         f"{rack.storage_server_capacity_bytes/1e12:.0f} TB = {storage_per_rack_tb:.0f} TB"
+    )
+    print(
+        f"KV residency in HBM: {hbm_residency*100:.0f}% (remaining contexts offloaded to system/NVMe)"
     )
     if rack.notes:
         print(f"Notes: {rack.notes}")
@@ -592,6 +637,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable plot generation (useful on headless or slow environments).",
     )
+    parser.add_argument(
+        "--hbm-residency",
+        type=float,
+        default=DEFAULT_HBM_RESIDENCY,
+        help=(
+            "Fraction of user KV cache kept on HBM at any time (others are phased to system memory/NVMe). "
+            "Range 0-1; default 0.50."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -600,6 +654,7 @@ def main() -> None:
     mode = args.mode.lower()
     racks = max(1, args.racks)
     model = MODEL_PRESETS[args.model]
+    hbm_residency = max(0.0, min(args.hbm_residency, 1.0))
 
     custom_batches = _parse_int_list(args.batch_sizes)
     batch_sizes = (
@@ -633,12 +688,19 @@ def main() -> None:
     print(f"Evaluating {racks} racks per preset.")
     print(f"Batch sizes: {batch_sizes}")
     print(f"Quant bits: {requested_bits}")
+    print(f"HBM residency: {hbm_residency:.2f} (phased users; remaining KV offloaded)")
     print()
 
     plot_dir = Path("plots")
     generated_plots: List[Tuple[str, Path]] = []
 
     for rack in RACK_PRESETS:
+        kv_system = None
+        if getattr(rack, "kv_system_key", None):
+            try:
+                kv_system = get_kv_system(rack.kv_system_key)
+            except KeyError:
+                kv_system = None
         sim_results = simulate_rack(
             rack=rack,
             model=model,
@@ -649,8 +711,17 @@ def main() -> None:
             pp_candidates=pp_candidates,
             ep_candidates=ep_candidates,
             mode=mode,
+            kv_system=kv_system,
+            hbm_residency=hbm_residency,
         )
-        print_summary(rack, sim_results, racks, mode, requested_bits)
+        print_summary(
+            rack,
+            sim_results,
+            racks,
+            mode,
+            requested_bits,
+            hbm_residency=hbm_residency,
+        )
         if args.skip_plots:
             continue
         plot_path = plot_results(rack, sim_results, racks, plot_dir, mode, model)

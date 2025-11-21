@@ -34,12 +34,17 @@ from llm_cluster_simulator import (
 from model import ModelConfig
 from presets import MODEL_PRESETS, QUANT_PRESETS, RACK_PRESETS
 from rack import RackPreset
-from utils import kv_bytes_per_token, human_gbytes, slugify
+from utils import (
+    DEFAULT_HBM_RESIDENCY,
+    NVME_FALLBACK_BANDWIDTH,
+    kv_bytes_per_token,
+    human_gbytes,
+    slugify,
+)
 from kv_subsystem import get_kv_system, kv_system_choices
 from dc_cluster_visualizer import render_cluster_diagram
 
 INFERENCE_KV_AMPLIFICATION = 1.1
-NVME_FALLBACK_BANDWIDTH = 32e9  # bytes/s per GPU for NVMe spill (approx PCIe 5 x4)
 
 def _parse_model_choice(raw: str) -> str:
     if raw in MODEL_PRESETS:
@@ -295,6 +300,15 @@ def parse_args() -> argparse.Namespace:
             ", ".join(kv_system_choices())
         ),
     )
+    parser.add_argument(
+        "--hbm-residency",
+        type=float,
+        default=DEFAULT_HBM_RESIDENCY,
+        help=(
+            "Fraction of users' KV cache resident in HBM at any time (0-1). "
+            "Remaining contexts are phased to system memory or NVMe; default 0.50."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -308,6 +322,8 @@ def _select_plan(
     required_tps: float,
     prefer_utilization: bool,
     allow_shortfall: bool,
+    kv_system,
+    hbm_residency: float,
 ) -> Optional[Tuple[int, Dict[str, float]]]:
     sim_results = simulate_rack(
         rack=rack,
@@ -319,6 +335,8 @@ def _select_plan(
         pp_candidates=[1, 2, 3, 4, 6, 8],
         ep_candidates=[1, 2, 4, 8],
         mode="inference",
+        kv_system=kv_system,
+        hbm_residency=hbm_residency,
     )
     if quant_bits not in sim_results:
         return None
@@ -481,6 +499,7 @@ def main() -> None:
             kv_system = get_kv_system(kv_system_key)
         except KeyError as exc:
             raise SystemExit(str(exc))
+    hbm_residency = max(0.0, min(args.hbm_residency, 1.0))
 
     batch_sizes = _parse_int_list(args.batch_sizes, DEFAULT_INFERENCE_BATCHES)
     required_users = max(1, args.active_users)
@@ -528,6 +547,8 @@ def main() -> None:
             required_tps=required_tps,
             prefer_utilization=args.prefer_utilization,
             allow_shortfall=allow_shortfall,
+            kv_system=kv_system,
+            hbm_residency=hbm_residency,
         )
         if choice:
             batch_size, plan = choice
@@ -664,6 +685,10 @@ def main() -> None:
         ("Quantisation", f"{quant_bits}-bit"),
         ("Users supported (capacity)", user_capacity_text),
         ("KV system", kv_label),
+        (
+            "HBM KV residency",
+            f"{hbm_residency*100:.0f}% on-GPU (phased users)",
+        ),
     ]
     if arrival_stats:
         rows.append(
@@ -851,6 +876,8 @@ def main() -> None:
             ep=plan["ep"],
             racks=racks_needed,
             mode="inference",
+            kv_system=kv_system,
+            hbm_residency=hbm_residency,
         )
         if not eval_plan:
             continue
@@ -895,6 +922,8 @@ def main() -> None:
             ep=plan["ep"],
             racks=racks_needed,
             mode="inference",
+            kv_system=kv_system,
+            hbm_residency=hbm_residency,
         )
         if not eval_plan:
             continue
@@ -933,6 +962,7 @@ def main() -> None:
         f"Users: {required_users} (capacity {concurrency_capacity})",
         f"Racks: {racks_needed} | GPUs active {gpus_required}/{provisioned_gpus}",
         f"Batch size: {batch_size} | Plan {plan['tp']}x{plan['pp']}x{plan['ep']}",
+        f"HBM KV residency: {hbm_residency*100:.0f}% on-GPU",
         (
             f"Storage servers needed {storage_servers_needed} (avail {storage_servers_available})"
             if racks_needed > 0

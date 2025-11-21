@@ -126,31 +126,27 @@ class KVCacheSystem:
             )
         return rows
 
-def _kv_registry() -> Tuple[Dict[str, KVCacheSystem], Dict[str, str]]:
-    from presets import KV_SYSTEM_ALIASES, KV_SYSTEM_PRESETS
+def _kv_registry() -> Dict[str, KVCacheSystem]:
+    from presets import KV_SYSTEM_PRESETS
 
-    return KV_SYSTEM_PRESETS, KV_SYSTEM_ALIASES
+    return KV_SYSTEM_PRESETS
 
 
 def resolve_kv_system_key(key: str) -> str:
-    presets, aliases = _kv_registry()
+    presets = _kv_registry()
     lookup = key.lower()
-    resolved = aliases.get(lookup, lookup)
-    if resolved not in presets:
-        raise KeyError(
-            f"Unknown KV system '{key}'. Known keys: {', '.join(sorted(presets))}"
-        )
-    return resolved
-
+    if lookup not in presets:
+        raise KeyError(f"Unknown KV system '{key}'. Known keys: {', '.join(sorted(presets))}")
+    return lookup
 
 def get_kv_system(key: str) -> KVCacheSystem:
-    presets, _ = _kv_registry()
+    presets = _kv_registry()
     return presets[resolve_kv_system_key(key)]
 
 
 def kv_system_choices() -> List[str]:
-    presets, aliases = _kv_registry()
-    return sorted(set(presets.keys()) | set(aliases.keys()))
+    presets = _kv_registry()
+    return sorted(presets.keys())
 
 
 __all__ = [
