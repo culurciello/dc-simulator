@@ -239,7 +239,6 @@ def _build_gb300_plain_kv_system() -> KVCacheSystem:
     )
 
 
-
 def _build_h100_plain_kv_system() -> KVCacheSystem:
     cpu = KVComponent(
         name="Grace CPU",
@@ -267,6 +266,7 @@ def _build_h100_plain_kv_system() -> KVCacheSystem:
         fabric_bandwidth=512e9,
         base_latency=250e-9,
         kv_dma_bandwidth=546e9,
+        kv_issue_cycles=200,  # GPU + CPU load/stores to shuttle KV
     )
     return KVCacheSystem(
         cpu=cpu,
@@ -274,9 +274,8 @@ def _build_h100_plain_kv_system() -> KVCacheSystem:
         kv_dram=kv_dram,
         switch=switch,
         label="Plain H100 host-offload",
+        gpu_kv_mode="cpu_bounce",
     )
-
-
 
 
 KV_SYSTEM_PRESETS: Dict[str, KVCacheSystem] = {

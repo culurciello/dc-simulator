@@ -13,6 +13,15 @@ The current presets cover 8 racks of:
 - AMD MI355X OAM racks (projected)
 
 
+What can I do with this, what is the GOAL of this repo?
+
+- to size an AI GPU cluster to your workload
+- to test various HW configurations without deploying them
+- to test back-end communication, and communication and compute nodes load
+
+
+
+
 Note: we include storage servers with 122 TB capacity for users swapping ain and out, but we do not include a provision for database servers to store users accounts.
 
 
@@ -184,6 +193,13 @@ Modeling how KV cache is utilized.
 ```
 python3 kv_offload_simulator.py
 ```
+
+You can compare systems with:
+
+```
+python3 kv_offload_simulator.py --kv-systems system_1,system_2
+``` 
+
 
 See `docs` for more info.
 

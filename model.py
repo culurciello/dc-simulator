@@ -16,6 +16,7 @@ class ModelConfig:
     num_layers: int
     hidden_size: int
     num_heads: int
+    kv_heads: int = 0  # optional override for KV heads (GQA/MQA/MLA); defaults to num_heads
     context_length: int       # prompt + cached tokens
     generation_window: int    # planned decode horizon per request
     experts_per_layer: int = 0
@@ -26,7 +27,12 @@ class ModelConfig:
 
     @property
     def flops_per_token(self) -> float:
-        return 2.0 * self.active_params
+        # Base matmul cost: 2 * active params (same as typical LLM FLOPs/token).
+        # Add a lightweight attention term that scales with sequence length so long
+        # prompts show the expected O(seq) growth; negligible for short contexts.
+        seq_len = max(self.total_cached_tokens, 1)
+        attn_flops = 2.0 * self.num_layers * self.hidden_size * seq_len
+        return 2.0 * self.active_params + attn_flops
 
     @property
     def total_cached_tokens(self) -> int:
@@ -48,4 +54,3 @@ class ModelConfig:
         expert_pool = self.num_params * self.expert_param_fraction
         expert_active = expert_pool * (self.active_experts / self.experts_per_layer)
         return shared + expert_active
-

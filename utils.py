@@ -48,8 +48,10 @@ def train_efficiency(global_batch: int) -> float:
 
 
 def kv_bytes_per_token(model: ModelConfig, quant: QuantConfig) -> float:
-    # 2 (key + value) * layers * hidden_size * bytes per element
-    return 2.0 * model.num_layers * model.hidden_size * quant.kv_bytes_per_elem
+    # 2 (key + value) * layers * kv_heads * head_dim * bytes per element.
+    kv_heads = model.kv_heads if model.kv_heads > 0 else model.num_heads
+    head_dim = model.hidden_size / max(model.num_heads, 1)
+    return 2.0 * model.num_layers * kv_heads * head_dim * quant.kv_bytes_per_elem
 
 
 def tensor_parallel_comm(model: ModelConfig, tp: int, pp: int) -> CommPattern:
