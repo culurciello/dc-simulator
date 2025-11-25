@@ -7,8 +7,10 @@ A lightweight rack-scale throughput estimator for running frontier LLMs (Qwen3-2
 plans, quantization (4/8/16 bit), and batch sizes for each hardware preset, then reports the sustained throughput ceiling and the bottleneck (compute, HBM, or fabric) for both inference and training workloads.
 
 The current presets cover 8 racks of:
+- NVIDIA H100 with NVL72 cabinets
 - NVIDIA GB200 NVL72 cabinets
 - NVIDIA GB300 NVL72 cabinets (projected)
+- NVIDIARubin CPX with NVL144 cabinets (projected)
 - AMD MI300X OAM racks
 - AMD MI355X OAM racks (projected)
 
@@ -168,6 +170,9 @@ puts on intra-server, inter-server, and inter-rack fabrics.
 `--model` accepts either the numeric shortcut (`1`, `2`, `3`) or the full preset key.
 Plots are saved as `plots/<rack>_<model>_<mode>.png`, so each model run preserves its own chart artifacts, and every plot overlays the 4/8/16-bit traces for quick comparison (the simulator will compute missing bits if needed to keep the plot complete).
 
+![inference results](images/results/nvidia_vera_rubin_chatgpt5_1p5t_inference.png)
+![inference results](images/results/nvidia_rubin_cpx_nvl144_chatgpt5_1p5t_inference.png)
+
 #### Training:
 
 Here we simualte a cluster used for training large AI LLM models.
@@ -183,7 +188,6 @@ Training summaries add per-instance and aggregate samples/sec (derived from
 steps/sec) plus data-parallel gradient load so you can gauge utilisation headroom
 on each fabric. Plots in this mode chart total samples processed per second.
 
-![training results](images/amd_mi355x_oam_rack_chatgpt5_1p5t_inference.png)
 
 
 #### KV-cache offloading:

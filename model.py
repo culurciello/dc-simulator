@@ -16,9 +16,9 @@ class ModelConfig:
     num_layers: int
     hidden_size: int
     num_heads: int
-    kv_heads: int = 0  # optional override for KV heads (GQA/MQA/MLA); defaults to num_heads
     context_length: int       # prompt + cached tokens
     generation_window: int    # planned decode horizon per request
+    kv_heads: int = 0  # optional override for KV heads (GQA/MQA/MLA); defaults to num_heads
     experts_per_layer: int = 0
     active_experts: int = 0
     expert_param_fraction: float = 0.0

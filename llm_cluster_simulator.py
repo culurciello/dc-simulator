@@ -272,6 +272,16 @@ def evaluate_plan(
     comm_tps = min(comm_limits) if comm_limits else float("inf")
 
     instance_tps = min(compute_tps, hbm_tps, comm_tps)
+    prefill_tps = None
+    prefill_ttft_s = None
+    decode_tpot_s = None
+    if not training:
+        prefill_tps = min(compute_tps, comm_tps)
+        prompt_tokens = model.context_length * batch_size
+        prefill_ttft_s = (
+            prompt_tokens / prefill_tps if prefill_tps and prefill_tps > 0 else float("inf")
+        )
+        decode_tpot_s = 1.0 / instance_tps if instance_tps > 0 else float("inf")
     limiting = "compute"
     if instance_tps == hbm_tps:
         limiting = "hbm"
@@ -335,6 +345,9 @@ def evaluate_plan(
         "comm_bound_per_gpu": comm_bound_per_gpu,
         "kv_residency": residency,
         "kv_remote_fraction": kv_remote_fraction,
+        "prefill_tps": prefill_tps,
+        "prefill_ttft_s": prefill_ttft_s,
+        "decode_tpot_s": decode_tpot_s,
         "mode": mode,
         "dp_degree": dp_degree,
         "steps_per_sec": steps_per_sec if training else None,
@@ -512,7 +525,7 @@ def print_summary(
             "  Batch | Quant | Tok/GPU(avg) | Inst TPS | Tot TPS | #Inst | GPUs/Inst | TPxPPxEP | "
             "Mem/GPU (GB) | Limit | Fabric Load per Inst (GB/s intra/inter/rack) | "
             "Msg Load per Inst (kmsg/s intra/inter/rack) | "
-            "Bounds tok/GPU(avg) (comp/hbm/comm)"
+            "Bounds tok/GPU(avg) (comp/hbm/comm) | TTFT (ms) | TPOT (ms)"
         )
     print(header)
     print("-" * len(header))
@@ -562,6 +575,8 @@ def print_summary(
                     f"{format_bound(plan['comm_bound_per_gpu'])}"
                 )
             else:
+                prefill_ms = (plan.get("prefill_ttft_s") or 0.0) * 1e3
+                tpot_ms = (plan.get("decode_tpot_s") or 0.0) * 1e3
                 print(
                     f"  {batch:5d} | {bits:5d} | {plan['tokens_per_gpu']:13.2f} | "
                     f"{plan['instance_tps']:10.2f} | {plan['total_tps']:10.1f} | "
@@ -572,7 +587,8 @@ def print_summary(
                     f"{intra_kmsg:5.1f}/{inter_kmsg:5.1f}/{rack_kmsg:5.1f} | "
                     f"{format_bound(plan['compute_bound_per_gpu'])}/"
                     f"{format_bound(plan['hbm_bound_per_gpu'])}/"
-                    f"{format_bound(plan['comm_bound_per_gpu'])}"
+                    f"{format_bound(plan['comm_bound_per_gpu'])} | "
+                    f"{prefill_ms:9.1f} | {tpot_ms:9.3f}"
                 )
     print()
 def _parse_int_list(raw: Optional[str]) -> Optional[List[int]]:

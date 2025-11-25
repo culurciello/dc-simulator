@@ -5,37 +5,45 @@ from kv_subsystem import KVCacheSystem, KVComponent, KVSwitch
 from model import ModelConfig, QuantConfig
 from rack import LinkProfile, RackPreset
 
+# See docs/model_assumptions.md for details
+efficiency_factor = 0.5 # using realistic decode-mode sustained values for FP16
 
 GPU_PRESETS: Dict[str, GPUConfig] = {
     "MI300X": GPUConfig(
         "AMD MI300X",
-        sustained_flops=11.5e12,
+        sustained_flops=efficiency_factor*1.305e15,  # Peak: FP16/BF16 1.305 PFLOPS, FP8 2.610 PFLOPS per GPU
         hbm_bw=1.9e12,
+        max_mem_bytes=192e9,
+    ),
+    "MI355X": GPUConfig(
+        "AMD MI355X",
+        sustained_flops=efficiency_factor*5e15,  # Peak: up to “10 PFLOPS” in FP8 for one GPU, “20 PFLOPS” in FP6/FP4
+        hbm_bw=2.4e12,
         max_mem_bytes=192e9,
     ),
     "H100": GPUConfig(
         "NVIDIA H100",
-        sustained_flops=18e12,
+        sustained_flops=efficiency_factor*1.979e15,  # Peak: FP16/BF16: 1,979 TFLOPS, FP8~3,960 TFLOPS (~3.96 PFLOPS) per GPU
         hbm_bw=3.3e12,
         max_mem_bytes=80e9,
     ),
-    "MI355X": GPUConfig(
-        "AMD MI355X",
-        sustained_flops=14.5e12,
-        hbm_bw=2.4e12,
-        max_mem_bytes=192e9,
-    ),
     "GB200": GPUConfig(
         "NVIDIA GB200",
-        sustained_flops=24e12,
+        sustained_flops=efficiency_factor*2.5e15,  # Peak: FP16/BF16: 2,500 TFLOPS, P8: ~5,000 TFLOPS
         hbm_bw=3.4e12,
         max_mem_bytes=192e9,
     ),
     "GB300": GPUConfig(
         "NVIDIA GB300",
-        sustained_flops=32e12,
+        sustained_flops=efficiency_factor*3.25e15,  # Peak: NVFP4 ~15 petaFLOPS per-GPU dense
         hbm_bw=4.3e12,
         max_mem_bytes=228e9,
+    ),
+    "RUBIN_CPX": GPUConfig(
+        "NVIDIA Rubin CPX",
+        sustained_flops=efficiency_factor*5e15,  # Peak: FP4 20 PFLOPs sustained
+        hbm_bw=2.0e12,          # GDDR7 effective bandwidth
+        max_mem_bytes=128e9,    # 128 GB GDDR7
     ),
 }
 
@@ -106,13 +114,27 @@ RACK_PRESETS: List[RackPreset] = [
         storage_servers_per_rack=3,
         storage_server_capacity_bytes=160e12,
     ),
+    RackPreset(
+        name="NVIDIA Rubin CPX NVL144",
+        gpu_key="RUBIN_CPX",
+        gpus_per_server=12,
+        servers_per_rack=12,  # 12 servers × 12 GPUs = 144 GPUs/rack
+        intra_server=LinkProfile(throughput=2.5e12, latency=0.9e-6),
+        inter_server=LinkProfile(throughput=1.4e12, latency=1.5e-6),
+        inter_rack=LinkProfile(throughput=0.75e12, latency=3.5e-6),
+        notes=(
+            "Speculative Rubin CPX NVL144 pod (12x12 GPUs) with 128 GB GDDR7, 2 TB/s mem BW. "
+            "Scale-out links rely on PCIe Gen6 to CX-9 NICs for GPU↔GPU traffic outside the node."
+        ),
+    ),
 ]
 
 
 QUANT_PRESETS: Dict[int, QuantConfig] = {
+    # compute_scale multiplies FP16 sustained FLOPs to capture precision speedups.
     16: QuantConfig(bits=16, bytes_per_param=2.0, compute_scale=1.0, kv_bytes_per_elem=2.0),
-    8: QuantConfig(bits=8, bytes_per_param=1.0, compute_scale=1.12, kv_bytes_per_elem=1.0),
-    4: QuantConfig(bits=4, bytes_per_param=0.5, compute_scale=1.18, kv_bytes_per_elem=0.75),
+    8: QuantConfig(bits=8, bytes_per_param=1.0, compute_scale=2.0, kv_bytes_per_elem=1.0),   # ~2x vs FP16
+    4: QuantConfig(bits=4, bytes_per_param=0.5, compute_scale=4.0, kv_bytes_per_elem=0.75),  # ~4x vs FP16
 }
 
 
@@ -237,7 +259,6 @@ def _build_gb300_plain_kv_system() -> KVCacheSystem:
         switch=switch,
         label="Vera-Rubin GB300 host-offload",
     )
-
 
 def _build_h100_plain_kv_system() -> KVCacheSystem:
     cpu = KVComponent(
